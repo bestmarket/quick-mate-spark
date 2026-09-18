@@ -1,12 +1,8 @@
 import { logUsage, resolveProvider } from "./aiConfig.server";
+import { withGeminiKey } from "./geminiKeys.server";
 
-const GATEWAY = "https://ai.gateway.lovable.dev/v1";
-
-function apiKey(): string {
-  const key = process.env["LOVABLE_API_KEY"];
-  if (!key) throw new Error("AI is not configured for this project yet.");
-  return key;
-}
+const NO_KEYS =
+  "No Google Gemini key is set up yet. Add one or more Gemini API keys in the admin panel.";
 
 async function gatewayError(res: Response): Promise<Error> {
   let message = `AI request failed (${res.status})`;
@@ -29,53 +25,6 @@ async function gatewayError(res: Response): Promise<Error> {
 
 /* ------------------------------------------------------------------ text */
 
-async function gatewayText(system: string, prompt: string, reasoning: string): Promise<string> {
-  const res = await fetch(`${GATEWAY}/responses`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Lovable-API-Key": apiKey(),
-      "X-Lovable-AIG-SDK": "fetch",
-    },
-    body: JSON.stringify({
-      model: "openai/gpt-6-astra",
-      instructions: system,
-      input: prompt,
-      stream: true,
-      reasoning: { effort: reasoning },
-    }),
-  });
-
-  if (!res.ok || !res.body) throw await gatewayError(res);
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let text = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      if (!line.startsWith("data:")) continue;
-      const payload = line.slice(5).trim();
-      if (!payload || payload === "[DONE]") continue;
-      try {
-        const event = JSON.parse(payload) as { type?: string; delta?: string };
-        if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
-          text += event.delta;
-        }
-      } catch {
-        /* ignore partial frames */
-      }
-    }
-  }
-
-  return text.trim();
-}
 
 async function geminiText(key: string, system: string, prompt: string): Promise<string> {
   const res = await fetch(
@@ -143,25 +92,20 @@ async function claudeText(key: string, system: string, prompt: string): Promise<
 export async function askAI(
   system: string,
   prompt: string,
-  opts?: { reasoning?: "low" | "medium" | "high" },
+  _opts?: { reasoning?: "low" | "medium" | "high" },
 ): Promise<string> {
   const provider = await resolveProvider("llm");
-  const reasoning = opts?.reasoning ?? "low";
   let text: string;
   try {
     if (provider.id === "openai-gpt4o" && provider.apiKey) {
       text = await openaiText(provider.apiKey, system, prompt);
     } else if (provider.id === "claude-sonnet" && provider.apiKey) {
       text = await claudeText(provider.apiKey, system, prompt);
-    } else if (provider.id === "gemini-flash") {
-      const { withGeminiKey } = await import("./geminiKeys.server");
+    } else {
       text = await withGeminiKey(
         provider.apiKey ?? process.env["GOOGLE_API_KEY"] ?? null,
         (key) => geminiText(key, system, prompt),
-        () => gatewayText(system, prompt, reasoning),
       );
-    } else {
-      text = await gatewayText(system, prompt, reasoning);
     }
   } catch (error) {
     await logUsage({ category: "llm", provider: provider.id, success: false });
@@ -202,22 +146,6 @@ export async function askAIJson<T>(
 
 /* ----------------------------------------------------------------- image */
 
-async function gatewayImage(prompt: string): Promise<Uint8Array> {
-  const res = await fetch(`${GATEWAY}/images/generations`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Lovable-API-Key": apiKey(),
-      "X-Lovable-AIG-SDK": "fetch",
-    },
-    body: JSON.stringify({ model: "lovable/image-fast", prompt, size: "1536x1024", n: 1 }),
-  });
-  if (!res.ok) throw await gatewayError(res);
-  const body = (await res.json()) as { data?: Array<{ b64_json?: string }> };
-  const b64 = body.data?.[0]?.b64_json;
-  if (!b64) throw new Error("The image could not be generated.");
-  return base64ToBytes(b64);
-}
 
 function base64ToBytes(b64: string): Uint8Array {
   const binary = atob(b64);
@@ -323,23 +251,19 @@ export async function generateSceneImage(prompt: string): Promise<Uint8Array> {
   const provider = await resolveProvider("image");
   try {
     let bytes: Uint8Array;
-    const googleKey = provider.apiKey ?? process.env["GOOGLE_API_KEY"] ?? null;
-    if (provider.id === "gemini-image") {
-      const { withGeminiKey } = await import("./geminiKeys.server");
-      bytes = await withGeminiKey(
-        googleKey,
-        (key) => geminiImage(key, prompt),
-        () => gatewayImage(prompt),
-      );
-    }
-    else if (provider.id === "pollinations") bytes = await pollinationsImage(prompt);
+    if (provider.id === "pollinations") bytes = await pollinationsImage(prompt);
     else if (provider.id === "huggingface" && provider.apiKey)
       bytes = await huggingFaceImage(provider.apiKey, prompt);
     else if (provider.id === "fal-flux" && provider.apiKey)
       bytes = await falImage(provider.apiKey, prompt);
     else if (provider.id === "replicate" && provider.apiKey)
       bytes = await replicateImage(provider.apiKey, prompt);
-    else bytes = await gatewayImage(prompt);
+    else
+      bytes = await withGeminiKey(
+        provider.apiKey ?? process.env["GOOGLE_API_KEY"] ?? null,
+        (key) => geminiImage(key, prompt),
+        () => pollinationsImage(prompt),
+      );
     await logUsage({ category: "image", provider: provider.id });
     return bytes;
   } catch (error) {
@@ -350,35 +274,6 @@ export async function generateSceneImage(prompt: string): Promise<Uint8Array> {
 
 /* ----------------------------------------------------------------- audio */
 
-async function gatewayNarration(
-  text: string,
-  voice: string,
-  direction = "warm, confident narrator voice",
-): Promise<Uint8Array> {
-  const res = await fetch(`${GATEWAY}/audio/speech`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Lovable-API-Key": apiKey(),
-      "X-Lovable-AIG-SDK": "fetch",
-    },
-    body: JSON.stringify({
-      model: "google/gemini-2.5-flash-tts",
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: `Read this aloud, ${direction}:\n\n${text}` }],
-        },
-      ],
-      generationConfig: {
-        responseModalities: ["AUDIO"],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
-      },
-    }),
-  });
-  if (!res.ok) throw await gatewayError(res);
-  return new Uint8Array(await res.arrayBuffer());
-}
 
 /** Wraps raw 16-bit mono PCM in a WAV container so the editor can play it. */
 function pcmToWav(pcm: Uint8Array, sampleRate: number): Uint8Array {
@@ -462,9 +357,8 @@ async function geminiNarration(
 
 /**
  * Generates narration audio (WAV) in the voice the person picked in the
- * production layout. Gemini keys in the admin pool narrate by default;
- * a saved ElevenLabs key upgrades the same voice picks, and the built-in
- * engine covers the app before any key is added.
+ * production layout. The Gemini key pool narrates by default; a saved
+ * ElevenLabs key upgrades the same voice picks.
  */
 export async function generateNarration(text: string, voice: string): Promise<Uint8Array> {
   const provider = await resolveProvider("tts");
@@ -474,15 +368,11 @@ export async function generateNarration(text: string, voice: string): Promise<Ui
     let bytes: Uint8Array;
     if (provider.id === "elevenlabs" && provider.apiKey) {
       bytes = await elevenLabsNarration(provider.apiKey, text, picked.elevenId);
-    } else if (provider.id === "gemini-tts") {
-      const { withGeminiKey } = await import("./geminiKeys.server");
+    } else {
       bytes = await withGeminiKey(
         provider.apiKey ?? process.env["GOOGLE_API_KEY"] ?? null,
         (key) => geminiNarration(key, text, picked.gatewayVoice, picked.direction),
-        () => gatewayNarration(text, picked.gatewayVoice, picked.direction),
       );
-    } else {
-      bytes = await gatewayNarration(text, picked.gatewayVoice, picked.direction);
     }
     await logUsage({ category: "tts", provider: provider.id });
     return bytes;
